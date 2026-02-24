@@ -1,0 +1,18 @@
+services:
+  api:
+    build: .
+    container_name: atxp2api
+    ports:
+      - "${PORT:-8741}:8741"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - API_KEY=${API_KEY:-}
+    command:
+      - "-a"
+      - "/app/data/accounts.json"
+      - "-p"
+      - "8741"
+      - "--api-key"
+      - "${API_KEY:-}"
+    restart: unless-stopped
