@@ -34,6 +34,59 @@ logging.basicConfig(
 )
 logger = logging.getLogger("register")
 
+MAX_RETRY = 2  # 失败后最多重试次数
+
+
+async def _try_register(
+    browser,
+    http_session: aiohttp.ClientSession,
+    index: int,
+    attempt: int,
+) -> tuple[bool, RegisterResult]:
+    """单次注册尝试，返回 (成功, 结果)"""
+    start = time.time()
+    tag = f"[{index}]" if attempt == 0 else f"[{index} 重试{attempt}]"
+
+    mail = DuckMailClient(http_session)
+    email = await mail.create_temp_email()
+    if not email:
+        return False, RegisterResult(
+            index=index, email="(创建失败)", status="失败",
+            error="临时邮箱创建失败", duration=time.time() - start,
+        )
+
+    context = await browser.new_context(
+        viewport={"width": 1280, "height": 720},
+        locale="en-US",
+    )
+    context.set_default_timeout(config.PAGE_TIMEOUT)
+
+    try:
+        result = await register_one(context, mail)
+        duration = time.time() - start
+
+        if result["success"]:
+            logger.info("%s 注册成功: %s (%.1f秒)", tag, email, duration)
+            return True, RegisterResult(
+                index=index, email=email, status="成功",
+                duration=duration, cookies=result.get("cookies", {}),
+                cookie_str=result.get("cookie_str", ""),
+            )
+        else:
+            logger.warning("%s 注册失败: %s - %s", tag, email, result["error"])
+            return False, RegisterResult(
+                index=index, email=email, status="失败",
+                error=result["error"], duration=duration,
+            )
+    except Exception as e:
+        logger.exception("%s 未预期错误", tag)
+        return False, RegisterResult(
+            index=index, email=email, status="失败",
+            error=f"未预期错误: {e}", duration=time.time() - start,
+        )
+    finally:
+        await context.close()
+
 
 async def _process_one(
     sem: asyncio.Semaphore,
@@ -42,56 +95,21 @@ async def _process_one(
     index: int,
     recorder: ResultRecorder,
 ) -> None:
-    """单个注册任务（受信号量并发控制）"""
+    """单个注册任务（带重试）"""
     async with sem:
-        start = time.time()
-        logger.info("[%d/%d] 开始", index + 1, config.TOTAL_ACCOUNTS)
+        logger.info("[%d/%d] 开始", index, config.TOTAL_ACCOUNTS)
 
-        # 1. 创建临时邮箱
-        mail = DuckMailClient(http_session)
-        email = await mail.create_temp_email()
-        if not email:
-            recorder.add(RegisterResult(
-                index=index + 1, email="(创建失败)", status="失败",
-                error="临时邮箱创建失败", duration=time.time() - start,
-            ))
-            return
-
-        # 2. 创建独立浏览器 context
-        context = await browser.new_context(
-            viewport={"width": 1280, "height": 720},
-            locale="en-US",
-        )
-        context.set_default_timeout(config.PAGE_TIMEOUT)
-
-        try:
-            # 3. 执行注册
-            result = await register_one(context, mail)
-            duration = time.time() - start
-
-            if result["success"]:
-                recorder.add(RegisterResult(
-                    index=index + 1, email=email, status="成功",
-                    duration=duration, cookies=result.get("cookies", {}),
-                    cookie_str=result.get("cookie_str", ""),
-                ))
-                logger.info("[%d] 注册成功: %s (%.1f秒)", index + 1, email, duration)
+        for attempt in range(1 + MAX_RETRY):
+            success, reg_result = await _try_register(browser, http_session, index, attempt)
+            if success:
+                recorder.add(reg_result)
+                return
+            # 最后一次失败才记录
+            if attempt == MAX_RETRY:
+                recorder.add(reg_result)
             else:
-                recorder.add(RegisterResult(
-                    index=index + 1, email=email, status="失败",
-                    error=result["error"], duration=duration,
-                ))
-                logger.warning("[%d] 注册失败: %s - %s", index + 1, email, result["error"])
-
-        except Exception as e:
-            recorder.add(RegisterResult(
-                index=index + 1, email=email, status="失败",
-                error=f"未预期错误: {e}", duration=time.time() - start,
-            ))
-            logger.exception("[%d] 未预期错误", index + 1)
-
-        finally:
-            await context.close()
+                logger.info("[%d] 准备重试 (%d/%d)...", index, attempt + 1, MAX_RETRY)
+                await asyncio.sleep(2)
 
 
 async def main(args: argparse.Namespace) -> None:
@@ -107,7 +125,7 @@ async def main(args: argparse.Namespace) -> None:
     logger.info("=" * 50)
     logger.info("高并发注册脚本启动")
     logger.info("目标: %s", config.TARGET_URL)
-    logger.info("总数: %d, 并发: %d, 无头: %s", config.TOTAL_ACCOUNTS, config.CONCURRENCY, config.HEADLESS)
+    logger.info("总数: %d, 并发: %d, 无头: %s, 重试: %d", config.TOTAL_ACCOUNTS, config.CONCURRENCY, config.HEADLESS, MAX_RETRY)
     logger.info("=" * 50)
 
     recorder = ResultRecorder()
@@ -122,7 +140,7 @@ async def main(args: argparse.Namespace) -> None:
             )
             try:
                 tasks = [
-                    _process_one(sem, browser, http_session, i, recorder)
+                    _process_one(sem, browser, http_session, i + 1, recorder)
                     for i in range(config.TOTAL_ACCOUNTS)
                 ]
                 await asyncio.gather(*tasks, return_exceptions=True)
